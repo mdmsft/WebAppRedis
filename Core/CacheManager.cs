@@ -15,7 +15,13 @@ namespace WebAppRedis.Core
 
         private const string AzureRedisEventsChannel = "AzureRedisEvents";
 
-        private bool isNodeMaintenance = false;
+        private long nodeMaintenance = 0;
+
+        private bool isNodeMaintenance
+        {
+            get => Interlocked.Read(ref nodeMaintenance) == 1;
+            set => Interlocked.Exchange(ref nodeMaintenance, value ? 1 : 0);
+        }
 
         long lastReconnectTicks = DateTimeOffset.MinValue.UtcTicks;
         DateTimeOffset firstError = DateTimeOffset.MinValue;
@@ -29,7 +35,13 @@ namespace WebAppRedis.Core
 
         private static readonly int retryMaxAttempts = 5;
 
+        private static readonly TimeSpan masterMaintenanceOffDelay = TimeSpan.FromMinutes(5);
+
         private readonly string connectionString;
+
+        private Timer masterMaintenanceTimer;
+
+        private Timer slaveMaintenanceTimer;
 
         private Lazy<ConnectionMultiplexer> multiplexer;
 
@@ -44,6 +56,15 @@ namespace WebAppRedis.Core
             connectionString = configuration.GetConnectionString("Redis");
 
             multiplexer = CreateMultiplexer();
+        }
+
+        private void MaintenanceCallback(object state)
+        {
+            if (state is bool maintenance && isNodeMaintenance != maintenance)
+            {
+                logger.LogInformation("Switching node maintenance {0}", maintenance ? "on" : "off");
+                isNodeMaintenance = maintenance;
+            }
         }
 
         public async Task StringSetAsync(RedisKey key, RedisValue value)
@@ -103,6 +124,8 @@ namespace WebAppRedis.Core
         public void Dispose()
         {
             UnsubscribeFromAzureRedisEvents();
+            masterMaintenanceTimer?.Dispose();
+            slaveMaintenanceTimer?.Dispose();
         }
 
         private void AzureRedisEventHandler(RedisChannel channel, RedisValue value)
@@ -113,14 +136,29 @@ namespace WebAppRedis.Core
             {
                 logger.LogInformation("Node maintenance scheduled for {timestamp:G} UTC", azureRedisEvent.StartTimeInUTC);
                 var delay = DateTimeOffset.UtcNow.Subtract(azureRedisEvent.StartTimeInUTC).Subtract(TimeSpan.FromSeconds(1));
-                Task.Delay(delay).Wait();
-                isNodeMaintenance = true;
-                logger.LogInformation("Switching on node maintenance toggle");
+                if (delay > TimeSpan.Zero)
+                {
+                    slaveMaintenanceTimer?.Dispose();
+                    slaveMaintenanceTimer = new Timer(MaintenanceCallback, true, delay, Timeout.InfiniteTimeSpan);
+                    logger.LogInformation("Scheduled node maintenance toggle switch in {0}", delay);
+
+                    if (!azureRedisEvent.IsReplica)
+                    {
+                        masterMaintenanceTimer?.Dispose();
+                        masterMaintenanceTimer = new Timer(MaintenanceCallback, false, delay.Add(masterMaintenanceOffDelay), Timeout.InfiniteTimeSpan);
+                        logger.LogInformation("Scheduled master maintenance toggle switch in {0}", delay.Add(masterMaintenanceOffDelay));
+                    }
+                }
+                else
+                {
+                    logger.LogWarning("Skipping node maintenance schedule due to negative delay {0}", delay);
+                }
+                
             }
             else if (azureRedisEvent.NotificationType == NotificationTypes.NodeMaintenanceEnded)
             {
                 logger.LogInformation("Node maintenance ended, switching off node maintenance toggle");
-                isNodeMaintenance = true;
+                MaintenanceCallback(false);
             }
         }
 

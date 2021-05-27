@@ -32,6 +32,8 @@ namespace WebAppRedis.Core
                             DateTimeOffset.TryParse(value, out StartTimeInUTC);
                             break;
                         case "isreplica":
+                            bool.TryParse(value, out IsReplica);
+                            break;
                         case "ipaddress":
                         case "sslport":
                         case "nonsslport":
@@ -47,6 +49,8 @@ namespace WebAppRedis.Core
         public readonly NotificationTypes NotificationType;
 
         public readonly DateTimeOffset StartTimeInUTC;
+
+        public readonly bool IsReplica;
     }
 
     internal enum NotificationTypes
